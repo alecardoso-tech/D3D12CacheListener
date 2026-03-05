@@ -127,6 +127,41 @@ void ParseManifestPayload(PEVENT_RECORD pEvent) {
     }
 }
 
+enum class AsdInitStep : uint32_t
+{
+    None,
+    Success,
+    ReadApplicationRegistration,
+    OpenPsdb,
+    IdentityCheck
+};
+
+TDHSTATUS GetAsdInitStep(PEVENT_RECORD pEvent, AsdInitStep& step) {
+    LPCWSTR szPropertyName = L"Step";
+
+    PROPERTY_DATA_DESCRIPTOR propDesc = {};
+    propDesc.PropertyName = reinterpret_cast<UINT_PTR>(szPropertyName);
+    propDesc.ArrayIndex = ULONG_MAX;
+
+    step = AsdInitStep::None;
+    ULONG valueSize = sizeof(step);
+    return TdhGetProperty(pEvent, 0, NULL, 1, &propDesc, valueSize, (PBYTE)&step);
+}
+
+LPCSTR AsdInitStepToString(AsdInitStep step)
+{ 
+    switch (step)
+    {
+    case AsdInitStep::None: return "None";
+    case AsdInitStep::Success: return "Success";
+    case AsdInitStep::ReadApplicationRegistration: return "ReadApplicationRegistration";
+    case AsdInitStep::OpenPsdb: return "OpenPsdb";
+    case AsdInitStep::IdentityCheck: return "IdentityCheck";
+    };
+
+    return "Step Unknown";
+}
+
 // Helper to get TraceLogging event name
 std::wstring GetTraceLoggingEventName(PEVENT_RECORD pEvent) {
     ULONG bufferSize = 0;
@@ -150,7 +185,15 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                 process_stats.emplace(pid, ProcessStats{});
                 asdinit_pids.insert(pid);
             }
-            std::cout << "ASDInit event seen for PID " << pid << "\n";
+
+            AsdInitStep step = AsdInitStep::None;
+            auto status = GetAsdInitStep(pEvent, step);
+
+            auto hasDefaultPsdb = (status == ERROR_SUCCESS) && step == AsdInitStep::Success ? "true" : "false";
+            auto stepString = (status == ERROR_SUCCESS) ? AsdInitStepToString(step) : "Error Parsing Event";
+
+
+            std::cout << "ASDInit event seen for PID " << pid << ", HasDefaultPsdb: " << hasDefaultPsdb << ", Step: " << stepString << "\n";
         }
     } else if (IsEqualGUID(pEvent->EventHeader.ProviderId, D3D12_MANIFEST_PROVIDER)) {
         DWORD pid = pEvent->EventHeader.ProcessId;
