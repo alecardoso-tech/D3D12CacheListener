@@ -34,6 +34,7 @@ struct CacheStats {
 };
 
 const size_t NUM_EVENT_TYPES = 3;
+static const char* event_names[NUM_EVENT_TYPES] = { "PSOs", "state objects", "state object additions" };
 
 // Update ProcessStats to track stats per event type
 struct ProcessStats {
@@ -46,7 +47,19 @@ struct ProcessStats {
     std::unordered_map<DWORD, LONGLONG> begin_qpc[NUM_EVENT_TYPES];
     // Accumulated total time in QPC ticks
     LONGLONG total_time_qpc[NUM_EVENT_TYPES] = {};
+
+    bool has_psdb = false;
+    std::string exe_name;
 };
+
+// Per-executable stored times: [event_type] -> total ms
+struct ExeTimes {
+    double total_time_ms[NUM_EVENT_TYPES] = {};
+    bool has_data = false;
+};
+
+// Global dictionary: exe name -> { asd_on times, asd_off times }
+std::unordered_map<std::string, std::pair<ExeTimes, ExeTimes>> g_exe_times; // pair<asd_on, asd_off>
 
 // QPC frequency for converting ETW timestamps to milliseconds
 LARGE_INTEGER g_qpcFrequency;
@@ -56,6 +69,55 @@ std::unordered_set<DWORD> asdinit_pids;
 std::mutex stats_mutex;
 std::atomic<bool> running{ true };
 
+std::string GetExeNameFromPID(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return "unknown";
+    char path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameA(hProcess, 0, path, &size)) {
+        CloseHandle(hProcess);
+        std::string full(path);
+        auto pos = full.find_last_of("\\/");
+        return pos != std::string::npos ? full.substr(pos + 1) : full;
+    }
+    CloseHandle(hProcess);
+    return "unknown";
+}
+
+void LogProcessTimes(DWORD pid, const ProcessStats& ps) {
+    const std::string& exe = ps.exe_name;
+    const char* asdMode = ps.has_psdb ? "ASD ON" : "ASD OFF";
+
+    auto& entry = g_exe_times[exe];
+    auto& times = ps.has_psdb ? entry.first : entry.second;
+
+    std::cout << "\n=== PID " << pid << " (" << exe << ", " << asdMode << ") exited ===\n";
+    for (int i = 0; i < NUM_EVENT_TYPES; ++i) {
+        double ms = g_qpcFrequency.QuadPart > 0 ? (double)ps.total_time_qpc[i] * 1000.0 / g_qpcFrequency.QuadPart : 0.0;
+        times.total_time_ms[i] = ms;
+        std::cout << "  [" << event_names[i] << "] Total time: " << std::fixed << std::setprecision(2) << ms << " ms\n";
+    }
+    times.has_data = true;
+
+    // If both ASD ON and ASD OFF data exist, show comparison
+    if (entry.first.has_data && entry.second.has_data) {
+        std::cout << "\n--- Comparison for " << exe << " (ASD ON vs ASD OFF) ---\n";
+        for (int i = 0; i < NUM_EVENT_TYPES; ++i) {
+            double asd_on_ms = entry.first.total_time_ms[i];
+            double asd_off_ms = entry.second.total_time_ms[i];
+            if (asd_off_ms > 0.0) {
+                double pct_faster = (asd_off_ms - asd_on_ms) / asd_off_ms * 100.0;
+                std::cout << "  [" << event_names[i] << "] ASD ON: " << std::fixed << std::setprecision(2) << asd_on_ms
+                          << " ms, ASD OFF: " << asd_off_ms << " ms, "
+                          << (pct_faster >= 0 ? "faster" : "slower") << " by " << std::abs(pct_faster) << "%\n";
+            } else {
+                std::cout << "  [" << event_names[i] << "] ASD OFF time is 0, cannot compare\n";
+            }
+        }
+        std::cout << std::flush;
+    }
+}
+
 // Add global handles for cleanup
 TRACEHANDLE g_sessionHandle = 0;
 EVENT_TRACE_PROPERTIES* g_props = nullptr;
@@ -63,7 +125,6 @@ std::atomic<bool> g_stopRequested{ false };
 
 // Print stats only if total_events for any event type changed since last print
 void PrintStats() {
-    static const char* event_names[NUM_EVENT_TYPES] = { "PSOs", "state objects", "state object additions" };
     std::lock_guard<std::mutex> lock(stats_mutex);
     for (auto& kv : process_stats) {
         DWORD pid = kv.first;
@@ -191,18 +252,19 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         std::wstring eventName = GetTraceLoggingEventName(pEvent);
         if (eventName == L"ASDInit") {
             DWORD pid = pEvent->EventHeader.ProcessId;
-            {
-                std::lock_guard<std::mutex> lock(stats_mutex);
-                process_stats.emplace(pid, ProcessStats{});
-                asdinit_pids.insert(pid);
-            }
-
             AsdInitStep step = AsdInitStep::None;
             auto status = GetAsdInitStep(pEvent, step);
-
-            auto hasDefaultPsdb = (status == ERROR_SUCCESS) && step == AsdInitStep::Success ? "true" : "false";
+            bool hasPsdb = (status == ERROR_SUCCESS) && step == AsdInitStep::Success;
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex);
+                auto res = process_stats.emplace(pid, ProcessStats{});
+                res.first->second.has_psdb = hasPsdb;
+                if (res.first->second.exe_name.empty())
+                    res.first->second.exe_name = GetExeNameFromPID(pid);
+                asdinit_pids.insert(pid);
+            }
+            auto hasDefaultPsdb = hasPsdb ? "true" : "false";
             auto stepString = (status == ERROR_SUCCESS) ? AsdInitStepToString(step) : "Error Parsing Event";
-
 
             std::cout << "ASDInit event seen for PID " << pid << ", HasDefaultPsdb: " << hasDefaultPsdb << ", Step: " << stepString << "\n";
         }
@@ -275,10 +337,10 @@ void StatsThreadFunc() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         {
             std::lock_guard<std::mutex> lock(stats_mutex);
-            // Remove stats for dead processes
+            // Remove stats for dead processes, log their times
             for (auto it = process_stats.begin(); it != process_stats.end(); ) {
                 if (!IsProcessAlive(it->first)) {
-                    std::cout << "Process " << it->first << " exited, removing stats.\n";
+                    LogProcessTimes(it->first, it->second);
                     asdinit_pids.erase(it->first);
                     it = process_stats.erase(it);
                 } else {
