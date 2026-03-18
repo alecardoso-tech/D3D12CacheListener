@@ -41,12 +41,15 @@ struct ProcessStats {
     size_t total_events[NUM_EVENT_TYPES] = {0, 0, 0};
     size_t hit_events[NUM_EVENT_TYPES] = {0, 0, 0};
     size_t last_printed_total_events[NUM_EVENT_TYPES] = {0, 0, 0};
-    LARGE_INTEGER asdinit_time = {};
-    LARGE_INTEGER first_cache_event_time[NUM_EVENT_TYPES] = {};
-    LARGE_INTEGER last_cache_event_time[NUM_EVENT_TYPES] = {};
+
+    // Per-thread begin timestamps for timing begin/end event pairs
+    std::unordered_map<DWORD, LONGLONG> begin_qpc[NUM_EVENT_TYPES];
+    // Accumulated total time in QPC ticks
+    LONGLONG total_time_qpc[NUM_EVENT_TYPES] = {};
 };
 
-LARGE_INTEGER g_qpcFrequency = {};
+// QPC frequency for converting ETW timestamps to milliseconds
+LARGE_INTEGER g_qpcFrequency;
 
 std::unordered_map<DWORD, ProcessStats> process_stats;
 std::unordered_set<DWORD> asdinit_pids;
@@ -69,16 +72,13 @@ void PrintStats() {
         for (int i = 0; i < NUM_EVENT_TYPES; ++i) {
             if (stats.total_events[i] != stats.last_printed_total_events[i]) {
                 double hit_rate = stats.total_events[i] == 0 ? 0.0 : (double)stats.hit_events[i] / stats.total_events[i] * 100.0;
+                double total_time_ms = g_qpcFrequency.QuadPart > 0 ? (double)stats.total_time_qpc[i] * 1000.0 / g_qpcFrequency.QuadPart : 0.0;
                 std::cout << "PID " << pid << " [" << event_names[i] << "]: "
                     << "Total events: " << stats.total_events[i] << ", "
                     << "Hits: " << stats.hit_events[i] << ", "
-                    << "Hit rate: " << std::fixed << std::setprecision(2) << hit_rate << "%";
-                if (stats.last_cache_event_time[i].QuadPart > 0 && g_qpcFrequency.QuadPart > 0) {
-                    LONGLONG startTick = stats.asdinit_time.QuadPart > 0 ? stats.asdinit_time.QuadPart : stats.first_cache_event_time[i].QuadPart;
-                    double elapsed_ms = (double)(stats.last_cache_event_time[i].QuadPart - startTick) / g_qpcFrequency.QuadPart * 1000.0;
-                    std::cout << ", Load time: " << std::fixed << std::setprecision(1) << elapsed_ms << " ms";
-                }
-                std::cout << "\n";
+                    << "Hit rate: " << std::fixed << std::setprecision(2) << hit_rate << "%, "
+                    << "Total time: " << total_time_ms << " ms\n";
+
                 stats.last_printed_total_events[i] = stats.total_events[i];
                 printed = true;
             }
@@ -133,11 +133,6 @@ void ParseManifestPayload(PEVENT_RECORD pEvent) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     auto& ps = process_stats[pid];
     ps.total_events[idx]++;
-    LARGE_INTEGER ts = pEvent->EventHeader.TimeStamp;
-    if (ps.first_cache_event_time[idx].QuadPart == 0) {
-        ps.first_cache_event_time[idx] = ts;
-    }
-    ps.last_cache_event_time[idx] = ts;
     if (stats.NumRequiredLookups == stats.NumRequiredHitsInPSDB) {
         ps.hit_events[idx]++;
     }
@@ -198,8 +193,7 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             DWORD pid = pEvent->EventHeader.ProcessId;
             {
                 std::lock_guard<std::mutex> lock(stats_mutex);
-                auto& ps = process_stats[pid];
-                ps.asdinit_time = pEvent->EventHeader.TimeStamp;
+                process_stats.emplace(pid, ProcessStats{});
                 asdinit_pids.insert(pid);
             }
 
@@ -221,6 +215,25 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         USHORT eid = pEvent->EventHeader.EventDescriptor.Id;
         if (eid == 161 || eid == 162 || eid == 163) {
             ParseManifestPayload(pEvent);
+        }
+        // Handle begin/end timing events (155/156=CreatePSO, 157/158=CreateStateObject, 159/160=AddStateObjects)
+        if (eid >= 155 && eid <= 160) {
+            int type_idx = (eid - 155) / 2;
+            bool is_begin = (eid % 2 == 1); // 155, 157, 159 are odd (begin)
+            DWORD tid = pEvent->EventHeader.ThreadId;
+            LONGLONG qpc = pEvent->EventHeader.TimeStamp.QuadPart;
+
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            auto& ps = process_stats[pid];
+            if (is_begin) {
+                ps.begin_qpc[type_idx][tid] = qpc;
+            } else {
+                auto it = ps.begin_qpc[type_idx].find(tid);
+                if (it != ps.begin_qpc[type_idx].end()) {
+                    ps.total_time_qpc[type_idx] += qpc - it->second;
+                    ps.begin_qpc[type_idx].erase(it);
+                }
+            }
         }
     }
 }
@@ -319,6 +332,7 @@ int main() {
     const wchar_t* sessionName = L"D3D12CacheListenerSession";
     ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 2 * 1024;
 
+    // Initialize QPC frequency for timestamp-to-ms conversion
     QueryPerformanceFrequency(&g_qpcFrequency);
 
     // Stop any existing session with the same name before starting
