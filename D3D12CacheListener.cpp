@@ -41,7 +41,12 @@ struct ProcessStats {
     size_t total_events[NUM_EVENT_TYPES] = {0, 0, 0};
     size_t hit_events[NUM_EVENT_TYPES] = {0, 0, 0};
     size_t last_printed_total_events[NUM_EVENT_TYPES] = {0, 0, 0};
+    LARGE_INTEGER asdinit_time = {};
+    LARGE_INTEGER first_cache_event_time[NUM_EVENT_TYPES] = {};
+    LARGE_INTEGER last_cache_event_time[NUM_EVENT_TYPES] = {};
 };
+
+LARGE_INTEGER g_qpcFrequency = {};
 
 std::unordered_map<DWORD, ProcessStats> process_stats;
 std::unordered_set<DWORD> asdinit_pids;
@@ -67,7 +72,13 @@ void PrintStats() {
                 std::cout << "PID " << pid << " [" << event_names[i] << "]: "
                     << "Total events: " << stats.total_events[i] << ", "
                     << "Hits: " << stats.hit_events[i] << ", "
-                    << "Hit rate: " << std::fixed << std::setprecision(2) << hit_rate << "%\n";
+                    << "Hit rate: " << std::fixed << std::setprecision(2) << hit_rate << "%";
+                if (stats.last_cache_event_time[i].QuadPart > 0 && g_qpcFrequency.QuadPart > 0) {
+                    LONGLONG startTick = stats.asdinit_time.QuadPart > 0 ? stats.asdinit_time.QuadPart : stats.first_cache_event_time[i].QuadPart;
+                    double elapsed_ms = (double)(stats.last_cache_event_time[i].QuadPart - startTick) / g_qpcFrequency.QuadPart * 1000.0;
+                    std::cout << ", Load time: " << std::fixed << std::setprecision(1) << elapsed_ms << " ms";
+                }
+                std::cout << "\n";
                 stats.last_printed_total_events[i] = stats.total_events[i];
                 printed = true;
             }
@@ -122,6 +133,11 @@ void ParseManifestPayload(PEVENT_RECORD pEvent) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     auto& ps = process_stats[pid];
     ps.total_events[idx]++;
+    LARGE_INTEGER ts = pEvent->EventHeader.TimeStamp;
+    if (ps.first_cache_event_time[idx].QuadPart == 0) {
+        ps.first_cache_event_time[idx] = ts;
+    }
+    ps.last_cache_event_time[idx] = ts;
     if (stats.NumRequiredLookups == stats.NumRequiredHitsInPSDB) {
         ps.hit_events[idx]++;
     }
@@ -182,7 +198,8 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             DWORD pid = pEvent->EventHeader.ProcessId;
             {
                 std::lock_guard<std::mutex> lock(stats_mutex);
-                process_stats.emplace(pid, ProcessStats{});
+                auto& ps = process_stats[pid];
+                ps.asdinit_time = pEvent->EventHeader.TimeStamp;
                 asdinit_pids.insert(pid);
             }
 
@@ -301,6 +318,8 @@ int main() {
     EVENT_TRACE_PROPERTIES* props = nullptr;
     const wchar_t* sessionName = L"D3D12CacheListenerSession";
     ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 2 * 1024;
+
+    QueryPerformanceFrequency(&g_qpcFrequency);
 
     // Stop any existing session with the same name before starting
     StopExistingSession(sessionName);
